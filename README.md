@@ -2,7 +2,7 @@
 
 ![Build Status](https://github.com/scopey/tail-burn/actions/workflows/release.yml/badge.svg)
 ![Go Version](https://img.shields.io/github/go-mod/go-version/scopey/tail-burn)
-![License](https://img.shields.io/github/license/scopey/tail-burn)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 **The "Mission Impossible" of file transfers.** Secure, identity-aware, single-use file sharing over [Tailscale](https://tailscale.com).
 
