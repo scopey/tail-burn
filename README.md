@@ -68,10 +68,10 @@ Run this on the machine with the file. It will generate a secure link.
 
 ```bash
 # Basic usage
-tail-burn send -target=user@github ./secret-plans.pdf
+tail-burn send -target=user@github ./secret-plans.pdf  ## user@github should be the Tailscale username
 
 # Enable debug logs (noisy)
-tail-burn send -debug -target=user@github ./secret-plans.pdf
+tail-burn send -debug -target=user@github ./secret-plans.pdf ## user@github should be the Tailscale username
 ```
 
 *Output:*
