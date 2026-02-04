@@ -1,0 +1,15 @@
+# Binaries
+tail-burn
+tail-burn.exe
+tail-burn-test
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Tailscale State Directory (Keep secrets local!)
+tsnet-*
+tailscaled.state
+
+# OS junk
+.DS_Store
