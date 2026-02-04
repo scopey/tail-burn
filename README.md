@@ -1,8 +1,8 @@
 # 🔥 tail-burn
 
-![Build Status](https://github.com/YOUR_USERNAME/tail-burn/actions/workflows/release.yml/badge.svg)
-![Go Version](https://img.shields.io/github/go-mod/go-version/YOUR_USERNAME/tail-burn)
-![License](https://img.shields.io/github/license/YOUR_USERNAME/tail-burn)
+![Build Status](https://github.com/scopey/tail-burn/actions/workflows/release.yml/badge.svg)
+![Go Version](https://img.shields.io/github/go-mod/go-version/scopey/tail-burn)
+![License](https://img.shields.io/github/license/scopey/tail-burn)
 
 **The "Mission Impossible" of file transfers.** Secure, identity-aware, single-use file sharing over [Tailscale](https://tailscale.com).
 
@@ -28,16 +28,16 @@
 Download the latest release for Windows, macOS, or Linux from the [Releases Page](../../releases).
 
 ### Option 2: Go Install
-\`\`\`bash
-go install github.com/YOUR_USERNAME/tail-burn@latest
-\`\`\`
+```bash
+go install github.com/scopey/tail-burn@latest
+```
 
 ### Option 3: Build from Source
-\`\`\`bash
-git clone https://github.com/YOUR_USERNAME/tail-burn.git
+```bash
+git clone https://github.com/scopey/tail-burn.git
 cd tail-burn
 go build -o tail-burn main.go
-\`\`\`
+```
 
 ---
 
@@ -50,14 +50,14 @@ go build -o tail-burn main.go
 3. Set it as an environment variable:
 
 **Linux / macOS:**
-\`\`\`bash
+```bash
 export TS_AUTHKEY="tskey-auth-k123456CNTRL-..."
-\`\`\`
+```
 
 **Windows (PowerShell):**
-\`\`\`powershell
+```powershell
 $env:TS_AUTHKEY="tskey-auth-k123456CNTRL-..."
-\`\`\`
+```
 
 ---
 
@@ -66,16 +66,16 @@ $env:TS_AUTHKEY="tskey-auth-k123456CNTRL-..."
 ### 1. Sending a File (Server)
 Run this on the machine with the file. It will generate a secure link.
 
-\`\`\`bash
+```bash
 # Basic usage
 tail-burn send -target=user@github ./secret-plans.pdf
 
 # Enable debug logs (noisy)
 tail-burn send -debug -target=user@github ./secret-plans.pdf
-\`\`\`
+```
 
 *Output:*
-\`\`\`text
+```text
 🔥 tail-burn (Server Mode)
 -------------------------------------------
 📦 File: secret-plans.pdf (2.4 MB)
@@ -83,17 +83,17 @@ tail-burn send -debug -target=user@github ./secret-plans.pdf
 -------------------------------------------
 🌐 Browser Link: https://tail-burn.tailnet-name.ts.net/a1b2c3...
 💻 Command:      tail-burn receive https://tail-burn...
-\`\`\`
+```
 
 ### 2. Receiving a File (Client)
 Run this on the destination machine. It handles the handshake and ensures the server shuts down cleanly.
 
-\`\`\`bash
+```bash
 tail-burn receive https://tail-burn.tailnet-name.ts.net/a1b2c3...
-\`\`\`
+```
 
 *Features:*
-- **Auto-Rename:** If \`secret-plans.pdf\` exists, it saves as \`secret-plans-1.pdf\`.
+- **Auto-Rename:** If `secret-plans.pdf` exists, it saves as `secret-plans-1.pdf`.
 - **Progress Bar:** Clean CLI output.
 - **Kill Signal:** Sends a cryptographic ACK to the server upon completion, triggering immediate server destruction.
 
@@ -107,9 +107,9 @@ Just click the link!
 
 ## 🛡 Security Model
 
-1.  **Identity Verification:** The server uses \`localClient.WhoIs()\` to cryptographically verify the IP address of the incoming request against the Tailscale coordination server. If the user isn't the target, the connection is dropped immediately (403 Forbidden).
+1.  **Identity Verification:** The server uses `localClient.WhoIs()` to cryptographically verify the IP address of the incoming request against the Tailscale coordination server. If the user isn't the target, the connection is dropped immediately (403 Forbidden).
 2.  **Traffic Encryption:** All data travels over WireGuard.
-3.  **State Cleanup:** The application runs with \`Ephemeral: true\` (mostly). It attempts to wipe its local state directory on exit to leave no trace of the temporary node key.
+3.  **State Cleanup:** The application runs with `Ephemeral: true` (mostly). It attempts to wipe its local state directory on exit to leave no trace of the temporary node key.
 
 ---
 
@@ -117,18 +117,9 @@ Just click the link!
 
 ### Running Tests
 We have local test coverage for utility logic (formatting, safe filenames).
-\`\`\`bash
+```bash
 go test -v
-\`\`\`
-
-### CI/CD
-This project uses **GitHub Actions** and **GoReleaser** to automatically build cross-platform binaries (Windows/Linux/Darwin) on every tag.
-
-\`\`\`bash
-# Trigger a release
-git tag v0.1.0
-git push origin v0.1.0
-\`\`\`
+```
 
 ---
 
