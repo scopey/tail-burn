@@ -12,13 +12,17 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
+	"tailscale.com/client/tailscale/apitype"
+	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tsnet"
 )
 
-// --- HTML TEMPLATE (Browser Fallback) ---
+// --- HTML TEMPLATE (Browser Fallback with UI Fix) ---
 const htmlTemplate = `
 <!DOCTYPE html>
 <html>
@@ -30,26 +34,91 @@ const htmlTemplate = `
         h1 { font-size: 24px; margin-bottom: 10px; }
         p { color: #52525b; margin-bottom: 30px; }
         .file-info { background: #f4f4f5; padding: 15px; border-radius: 8px; margin-bottom: 25px; font-family: monospace; font-size: 14px; text-align: left; }
-        .btn { background: #ef4444; color: white; border: none; padding: 12px 24px; border-radius: 6px; font-size: 16px; font-weight: 600; cursor: pointer; width: 100%; }
+        .btn { background: #ef4444; color: white; border: none; padding: 12px 24px; border-radius: 6px; font-size: 16px; font-weight: 600; cursor: pointer; width: 100%; transition: background 0.2s; }
         .btn:hover { background: #dc2626; }
+        .btn:disabled { background: #a1a1aa; cursor: not-allowed; }
         .footer { margin-top: 20px; font-size: 12px; color: #a1a1aa; }
+        .success-icon { font-size: 48px; display: block; margin-bottom: 20px; }
         .hidden { display: none; }
     </style>
+    <script>
+        function triggerBurn() {
+            var btn = document.getElementById('dlBtn');
+            var card = document.getElementById('mainContent');
+            var done = document.getElementById('doneState');
+            
+            // 1. Disable button immediately
+            btn.disabled = true;
+            btn.innerText = "Downloading...";
+            
+            // 2. Wait 1 second (ensure POST submits), then show Done state
+            setTimeout(function() {
+                card.classList.add('hidden');
+                done.classList.remove('hidden');
+            }, 1000);
+        }
+    </script>
 </head>
 <body>
-    <div class="card" id="mainCard">
-        <h1>🔥 Secure Drop</h1>
-        <p><b>{{.Sender}}</b> sent a file.</p>
-        <div class="file-info">
-            <div>📄 <b>{{.FileName}}</b></div>
-            <div>📦 <b>{{.FileSize}}</b></div>
+    <div class="card">
+        <div id="mainContent">
+            <h1>🔥 Secure Drop</h1>
+            <p><b>{{.Sender}}</b> sent a file.</p>
+            <div class="file-info">
+                <div>📄 <b>{{.FileName}}</b></div>
+                <div>📦 <b>{{.FileSize}}</b></div>
+            </div>
+            <form method="POST" onsubmit="triggerBurn()">
+                <button id="dlBtn" type="submit" class="btn">Download & Destroy</button>
+            </form>
+            <div class="footer">⚠️ One-time use link.</div>
         </div>
-        <form method="POST"><button type="submit" class="btn">Download & Destroy</button></form>
-        <div class="footer">⚠️ One-time use link.</div>
+
+        <div id="doneState" class="hidden">
+            <span class="success-icon">💥</span>
+            <h1>File Burned</h1>
+            <p>The file has been downloaded and the server is self-destructing.</p>
+            <div class="footer">You may close this tab.</div>
+        </div>
     </div>
 </body>
 </html>
 `
+
+// --- HTML TEMPLATE (Burned Link) ---
+const burnedHTMLTemplate = `
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Tail-Burn</title>
+    <style>
+        body { font-family: -apple-system, system-ui, sans-serif; background: #f4f4f5; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; color: #18181b; }
+        .card { background: white; padding: 40px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); text-align: center; max-width: 400px; width: 100%; }
+        h1 { font-size: 24px; margin-bottom: 10px; }
+        p { color: #52525b; margin-bottom: 30px; }
+        .success-icon { font-size: 48px; display: block; margin-bottom: 20px; }
+        .footer { margin-top: 20px; font-size: 12px; color: #a1a1aa; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <span class="success-icon">💥</span>
+        <h1>Link Burned</h1>
+        <p>This link has already been used or is no longer available.</p>
+        <div class="footer">Please request a new link.</div>
+    </div>
+</body>
+</html>
+`
+
+type tailBurnClient interface {
+	WhoIs(ctx context.Context, remoteAddr string) (*apitype.WhoIsResponse, error)
+	Status(ctx context.Context) (*ipnstate.Status, error)
+}
+
+var landingTemplate = template.Must(template.New("landing").Parse(htmlTemplate))
+var burnedTemplate = template.Must(template.New("burned").Parse(burnedHTMLTemplate))
+var browserShutdownDelay = 5 * time.Second
 
 func main() {
 	if len(os.Args) < 2 {
@@ -69,8 +138,8 @@ func main() {
 
 func printUsage() {
 	fmt.Println("Usage:")
-	fmt.Println("  tail-burn send -target=<user> <file>   # Host a file")
-	fmt.Println("  tail-burn receive <url>                # Download a file")
+	fmt.Println("  tail-burn send -target=<user> [-wipe] <file>   # Host a file")
+	fmt.Println("  tail-burn receive <url>                        # Download a file")
 }
 
 // ==========================================
@@ -80,35 +149,36 @@ func runSender() {
 	sendCmd := flag.NewFlagSet("send", flag.ExitOnError)
 	targetUser := sendCmd.String("target", "", "Tailscale login name")
 	timeoutMinutes := sendCmd.Int("timeout", 10, "Minutes before auto-burn")
-	debugMode := sendCmd.Bool("debug", false, "Enable verbose Tailscale logs") // <--- NEW DEBUG FLAG
+	debugMode := sendCmd.Bool("debug", false, "Enable verbose Tailscale logs")
+	wipe := sendCmd.Bool("wipe", false, "Delete source file after successful transfer")
+
 	sendCmd.Parse(os.Args[2:])
 	filePath := sendCmd.Arg(0)
 
 	if *targetUser == "" || filePath == "" {
-		fmt.Println("Usage: tail-burn send -target=<user@provider> <file_path>")
+		fmt.Println("Usage: tail-burn send -target=<user@provider> [-wipe] <file_path>")
 		os.Exit(1)
 	}
 
 	// File Prep
-	file, err := os.Open(filePath)
+	stat, err := os.Stat(filePath)
 	if err != nil {
-		log.Fatalf("❌ Error opening file: %v", err)
+		log.Fatalf("❌ Error stating file: %v", err)
 	}
-	defer file.Close()
-	stat, _ := file.Stat()
 	fileSize := formatBytes(stat.Size())
 	fileName := filepath.Base(filePath)
 
 	// Hostname & State
 	randSuffix := make([]byte, 2)
-	rand.Read(randSuffix)
+	if _, err := rand.Read(randSuffix); err != nil {
+		log.Fatalf("❌ Error generating hostname suffix: %v", err)
+	}
 	hostname := fmt.Sprintf("tail-burn-%x", randSuffix)
 
 	configDir, _ := os.UserConfigDir()
 	stateDir := filepath.Join(configDir, "tsnet-"+hostname)
 
 	// --- LOGGING LOGIC ---
-	// If -debug is NOT set, we silence the tsnet engine logs
 	var tsLogf func(string, ...any)
 	if *debugMode {
 		tsLogf = log.Printf
@@ -121,7 +191,7 @@ func runSender() {
 		Dir:       stateDir,
 		Ephemeral: true,
 		AuthKey:   os.Getenv("TS_AUTHKEY"),
-		Logf:      tsLogf, // <--- Apply the conditional logger
+		Logf:      tsLogf,
 	}
 	defer func() {
 		s.Close()
@@ -135,21 +205,105 @@ func runSender() {
 
 	// Generate Secret URL
 	randBytes := make([]byte, 12)
-	rand.Read(randBytes)
+	if _, err := rand.Read(randBytes); err != nil {
+		log.Fatalf("❌ Error generating secret path: %v", err)
+	}
 	secretPath := "/" + hex.EncodeToString(randBytes)
 	ackPath := secretPath + "/ack" // The "Kill Switch" endpoint
 
-	shutdownSignal := make(chan string) // String for exit reason
+	shutdownSignal := make(chan string, 1) // Buffered channel to prevent blocking
 
 	// Handlers
 	mux := http.NewServeMux()
+	registerHandlers(mux, localClient, *targetUser, filePath, fileName, fileSize, shutdownSignal, secretPath, ackPath)
+
+	ln, err := s.Listen("tcp", ":80")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// FIX: Timeouts added for security
+	srv := &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+
+	// UI Output
+	fmt.Print("\033[H\033[2J")
+	fmt.Println("🔥 \033[1mtail-burn\033[0m (Server Mode)")
+	fmt.Println("-------------------------------------------")
+	fmt.Printf("📦 File: %s (%s)\n", fileName, fileSize)
+	fmt.Printf("👤 Target: %s\n", *targetUser)
+	if *wipe {
+		fmt.Println("⚠️  MODE: \033[31mWIPE ENABLED (File will be deleted)\033[0m")
+	}
+	fmt.Println("-------------------------------------------")
+	url := fmt.Sprintf("http://%s%s", hostname, secretPath)
+	fmt.Printf("🌐 Browser Link: \033[32m%s\033[0m\n", url)
+	fmt.Printf("💻 Command:      \033[33mtail-burn receive %s\033[0m\n", url)
+	fmt.Println("\n(Waiting...)")
+
+	go func() {
+		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+			log.Printf("❌ Server error: %v", err)
+		}
+	}()
+
+	// Doomsday Timer
+	go func() {
+		time.Sleep(time.Duration(*timeoutMinutes) * time.Minute)
+		select {
+		case shutdownSignal <- "Timeout reached":
+		default:
+		}
+	}()
+
+	reason := <-shutdownSignal
+	fmt.Printf("\n🛑 Shutting down: %s\n", reason)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	srv.Shutdown(ctx)
+
+	// --- WIPE LOGIC RESTORED ---
+	if *wipe {
+		fmt.Println("🔥 Deleting source file...")
+		// We can safely remove because server shutdown ensures file handles are closed
+		if err := os.Remove(filePath); err != nil {
+			log.Printf("❌ Failed to wipe file: %v", err)
+		} else {
+			fmt.Println("✅ Source file deleted.")
+		}
+	}
+}
+
+func registerHandlers(
+	mux *http.ServeMux,
+	localClient tailBurnClient,
+	targetUser string,
+	filePath string,
+	fileName string,
+	fileSize string,
+	shutdownSignal chan string,
+	secretPath string,
+	ackPath string,
+) {
+	var used atomic.Bool
+	var inProgress atomic.Bool
 
 	// 1. The ACK Handler (Smart Client Kill Switch)
 	mux.HandleFunc(ackPath, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "POST" {
 			log.Println("⚡️ ACK received from smart client.")
 			w.Write([]byte("OK"))
-			shutdownSignal <- "Client confirmed receipt"
+			used.Store(true)
+			select {
+			case shutdownSignal <- "Client confirmed receipt":
+			default:
+			}
 		}
 	})
 
@@ -160,7 +314,7 @@ func runSender() {
 			http.Error(w, "Identity Error", 500)
 			return
 		}
-		if !strings.EqualFold(who.UserProfile.LoginName, *targetUser) {
+		if !strings.EqualFold(who.UserProfile.LoginName, targetUser) {
 			log.Printf("⛔️ BLOCKED: %s", who.UserProfile.LoginName)
 			http.Error(w, "Forbidden", 403)
 			return
@@ -169,78 +323,96 @@ func runSender() {
 		// Detect if it's our smart client
 		isSmartClient := r.Header.Get("X-Tail-Burn-Client") == "true"
 
+		if used.Load() {
+			if !isSmartClient {
+				w.WriteHeader(http.StatusGone)
+				_ = burnedTemplate.Execute(w, nil)
+				return
+			}
+			http.Error(w, "Gone", http.StatusGone)
+			return
+		}
+
 		if r.Method == "GET" && !isSmartClient {
 			// Browser: Show HTML
 			sender := "A Tailscale User"
 			st, err := localClient.Status(r.Context())
-			if err == nil {
+			if err == nil && st != nil && st.Self != nil {
 				myUserID := st.Self.UserID
 				if profile, ok := st.User[myUserID]; ok {
 					sender = profile.LoginName
 				}
 			}
 
-			tmpl, _ := template.New("landing").Parse(htmlTemplate)
-			tmpl.Execute(w, struct{ Sender, FileName, FileSize string }{sender, fileName, fileSize})
+			if err := landingTemplate.Execute(w, struct{ Sender, FileName, FileSize string }{sender, fileName, fileSize}); err != nil {
+				http.Error(w, "Template Error", http.StatusInternalServerError)
+				return
+			}
 			return
 		}
 
 		if r.Method == "POST" || (r.Method == "GET" && isSmartClient) {
+			if !inProgress.CompareAndSwap(false, true) {
+				if !isSmartClient {
+					w.WriteHeader(http.StatusGone)
+					_ = burnedTemplate.Execute(w, nil)
+					return
+				}
+				http.Error(w, "Gone", http.StatusGone)
+				return
+			}
+			success := false
+			defer func() {
+				if !success {
+					inProgress.Store(false)
+				}
+			}()
+
 			log.Printf("🚀 Sending file to %s...", who.UserProfile.LoginName)
+
+			// Open file fresh for every request
+			file, err := os.Open(filePath)
+			if err != nil {
+				http.Error(w, "File Error", http.StatusInternalServerError)
+				return
+			}
+			defer file.Close()
+
+			fi, err := file.Stat()
+			if err != nil {
+				http.Error(w, "File Error", http.StatusInternalServerError)
+				return
+			}
 			w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", fileName))
 			w.Header().Set("Content-Type", "application/octet-stream")
-			w.Header().Set("Content-Length", fmt.Sprintf("%d", stat.Size()))
+			w.Header().Set("Content-Length", strconv.FormatInt(fi.Size(), 10))
 
 			if _, err := io.Copy(w, file); err != nil {
 				log.Printf("❌ Transfer failed: %v", err)
 				return
 			}
-			if f, ok := w.(http.Flusher); ok { f.Flush() }
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+
+			inProgress.Store(false)
+			success = true
 
 			// If it's a browser (POST), we have to guess when to shut down
 			if !isSmartClient {
+				used.Store(true)
 				log.Println("🔥 Browser transfer complete. Starting timer...")
 				go func() {
-					time.Sleep(5 * time.Second)
-					shutdownSignal <- "Browser download finished"
+					time.Sleep(browserShutdownDelay)
+					select {
+					case shutdownSignal <- "Browser download finished":
+					default:
+					}
 				}()
 			}
 			// If it's a smart client, we do NOTHING here. We wait for the /ack POST.
 		}
 	})
-
-	ln, err := s.Listen("tcp", ":80")
-	if err != nil {
-		log.Fatal(err)
-	}
-	srv := &http.Server{Handler: mux}
-
-	// UI Output
-	fmt.Print("\033[H\033[2J")
-	fmt.Println("🔥 \033[1mtail-burn\033[0m (Server Mode)")
-	fmt.Println("-------------------------------------------")
-	fmt.Printf("📦 File: %s (%s)\n", fileName, fileSize)
-	fmt.Printf("👤 Target: %s\n", *targetUser)
-	fmt.Println("-------------------------------------------")
-	url := fmt.Sprintf("http://%s%s", hostname, secretPath)
-	fmt.Printf("🌐 Browser Link: \033[32m%s\033[0m\n", url)
-	fmt.Printf("💻 Command:      \033[33mtail-burn receive %s\033[0m\n", url)
-	fmt.Println("\n(Waiting...)")
-
-	go srv.Serve(ln)
-
-	// Doomsday Timer
-	go func() {
-		time.Sleep(time.Duration(*timeoutMinutes) * time.Minute)
-		shutdownSignal <- "Timeout reached"
-	}()
-
-	reason := <-shutdownSignal
-	fmt.Printf("\n🛑 Shutting down: %s\n", reason)
-	
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	srv.Shutdown(ctx)
 }
 
 // ==========================================
@@ -256,21 +428,30 @@ func runReceiver() {
 		os.Exit(1)
 	}
 
+	if err := receive(url); err != nil {
+		log.Fatalf("❌ %v", err)
+	}
+}
+
+func receive(url string) error {
 	fmt.Println("🔍 Connecting to tail-burn server...")
 
 	// 1. Start Download Request
-	client := &http.Client{}
-	req, _ := http.NewRequest("GET", url, nil)
+	client := &http.Client{Timeout: 60 * time.Second}
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return fmt.Errorf("bad request URL: %w", err)
+	}
 	req.Header.Set("X-Tail-Burn-Client", "true") // Identify ourselves
 
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Fatalf("❌ Connection failed: %v", err)
+		return fmt.Errorf("connection failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		log.Fatalf("❌ Server rejected request: HTTP %d", resp.StatusCode)
+		return fmt.Errorf("server rejected request: HTTP %d", resp.StatusCode)
 	}
 
 	// Extract Filename
@@ -282,7 +463,7 @@ func runReceiver() {
 			filename = strings.TrimSuffix(parts[1], "\"")
 		}
 	}
-	
+
 	// --- AUTO-RENAME LOGIC ---
 	safeName := getSafeFilename(filename)
 	if safeName != filename {
@@ -294,7 +475,7 @@ func runReceiver() {
 	// Create File
 	out, err := os.Create(filename)
 	if err != nil {
-		log.Fatalf("❌ Cannot create file: %v", err)
+		return fmt.Errorf("cannot create file: %w", err)
 	}
 	defer out.Close()
 
@@ -302,7 +483,11 @@ func runReceiver() {
 	fmt.Printf("📥 Downloading '%s'...\n", filename)
 	size, err := io.Copy(out, resp.Body)
 	if err != nil {
-		log.Fatalf("❌ Download interrupted: %v", err)
+		return fmt.Errorf("download interrupted: %w", err)
+	}
+	// FIX: Check Content-Length integrity
+	if resp.ContentLength > 0 && size != resp.ContentLength {
+		return fmt.Errorf("download incomplete: expected %d bytes, got %d", resp.ContentLength, size)
 	}
 	fmt.Printf("✅ Download complete (%s)\n", formatBytes(size))
 
@@ -310,11 +495,17 @@ func runReceiver() {
 	fmt.Println("📡 Sending kill signal to server...")
 	ackURL := url + "/ack"
 	ackResp, err := client.Post(ackURL, "text/plain", nil)
-	if err == nil && ackResp.StatusCode == 200 {
-		fmt.Println("💥 Server confirmed destruction.")
+	if err == nil {
+		defer ackResp.Body.Close()
+		if ackResp.StatusCode == 200 {
+			fmt.Println("💥 Server confirmed destruction.")
+		} else {
+			fmt.Println("⚠️ Server responded but did not confirm destruction.")
+		}
 	} else {
 		fmt.Println("⚠️ Server may have already timed out (Link is dead).")
 	}
+	return nil
 }
 
 // --- HELPER: Find a unique filename (test.bin -> test-1.bin) ---
@@ -344,7 +535,9 @@ func getSafeFilename(name string) string {
 
 func formatBytes(b int64) string {
 	const unit = 1024
-	if b < unit { return fmt.Sprintf("%d B", b) }
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
 	div, exp := int64(unit), 0
 	for n := b / unit; n >= unit; n /= unit {
 		div *= unit
